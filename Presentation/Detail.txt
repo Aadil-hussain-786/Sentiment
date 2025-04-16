@@ -1,23 +1,6 @@
-_Project-Structure_
-src/
-├── core/
-│   ├── analyzer.py           # Main analysis logic
-│   ├── models.py             # Model loading/inference
-│   └── preprocessing.py      # Text cleaning pipeline
-├── api/
-│   ├── fastapi_app.py        # REST API server
-│   └── schemas.py            # Pydantic models
-├── web/
-│   ├── app.py                # Gradio interface
-│   └── assets/               # CSS/images
-├── tests/
-│   ├── unit/                 # Component tests
-│   └── integration/          # Full pipeline tests
-├── configs/                  # Configuration files
-├── scripts/                  # Utility scripts
-└── data/                     # Example datasets
 
-Performance
+
+_Performance_
 Benchmark Results
 Model	Accuracy	Inference Time (GPU)
 Sentiment	89%	120ms
@@ -25,7 +8,7 @@ Sarcasm	83%	150ms
 Emotion	76%	200ms
 Ensemble	91%	450ms
 
-Advanced Mode:
+_Advanced Mode:_
 Toggle for detailed metrics
 Model comparison view
 Contributing
