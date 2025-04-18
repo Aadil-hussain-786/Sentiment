@@ -132,3 +132,29 @@ graph TD
     O --> P[Confidence Calibration]
     P --> Q[Result Formatting]
     Q --> R[Output]
+
+## API Documentation
+
+### `EnhancedSentimentAnalyzer` Class Methods
+
+| Method | Parameters | Return Type | Description | Time Complexity |
+|--------|------------|-------------|-------------|------------------|
+| `analyze(text: str)` | `text`: Input string<br>`detailed`: bool (False) | `Dict` | Full analysis pipeline | O(n) |
+| `get_sentiment(text: str)` | `text`: Input string | `Dict[str, float]` | Basic sentiment scores | O(n) |
+| `detect_sarcasm(text: str)` | `text`: Input string<br>`threshold`: float (0.65) | `Dict[str, Union[float, bool]]` | Sarcasm probability + binary classification | O(n) |
+| `get_emotions(text: str, top_k: int = 3)` | `text`: Input string<br>`top_k`: Number of emotions to return | `Dict[str, float]` | Top emotion scores | O(n) |
+| `batch_analyze(texts: List[str])` | `texts`: List of strings<br>`batch_size`: int (8) | `List[Dict]` | Process multiple texts | O(n*m) |
+
+### REST API Endpoints
+
+```http
+POST /api/v1/analyze
+Content-Type: application/json
+
+{
+  "text": "Your input text here",
+  "options": {
+    "detailed": true,
+    "language": "en"
+  }
+}
