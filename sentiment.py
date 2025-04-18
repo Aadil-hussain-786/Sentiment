@@ -1,443 +1,425 @@
-import numpy as np
-import pandas as pd
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from transformers import pipeline
-import torch
-from torch.nn.functional import softmax
-from nltk.sentiment import SentimentIntensityAnalyzer
-import nltk
-import warnings
 import gradio as gr
+import torch
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    MarianMTModel,
+    MarianTokenizer
+)
 from typing import Dict, Tuple, List
-import re
-from collections import defaultdict
+import numpy as np
+from time import sleep
+import warnings
+from langdetect import detect
 
-# Ensure NLTK resources are downloaded
-nltk.download(['vader_lexicon', 'punkt', 'stopwords', 'wordnet'])
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
+warnings.filterwarnings("ignore")
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
+# Configuration
+MODELS = {
+    "en": {
+        "sentiment": "cardiffnlp/twitter-roberta-base-sentiment-latest",
+        "emotion": "SamLowe/roberta-base-go_emotions",
+        "sarcasm": "yiyanghkust/finbert-tone"
+    },
+    "multilingual": {
+        "sentiment": "nlptown/bert-base-multilingual-uncased-sentiment",
+        "translation": "Helsinki-NLP/opus-mt-mul-en"
+    }
+}
 
-class EnhancedSentimentAnalyzer:
-    """
-    Advanced Sentiment Analysis Tool with sarcasm and emotion detection
-    """
-    def __init__(self):
-        # Initialize the transformer-based sentiment model
-        self.sentiment_model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-        self.sentiment_tokenizer = AutoTokenizer.from_pretrained(self.sentiment_model_name)
-        self.sentiment_model = AutoModelForSequenceClassification.from_pretrained(self.sentiment_model_name)
+# Device configuration
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Load models
+models = {}
+tokenizers = {}
+
+print("Loading models...")
+for lang, model_dict in MODELS.items():
+    if lang == "multilingual":
+        # Translation model for multilingual support
+        translation_model_name = model_dict["translation"]
+        models["translation"] = MarianMTModel.from_pretrained(translation_model_name).to(device)
+        tokenizers["translation"] = MarianTokenizer.from_pretrained(translation_model_name)
         
-        # Initialize sarcasm detection model
-        self.sarcasm_model_name = "sismetanin/roberta-base-sarcasm-detection"
-        self.sarcasm_tokenizer = AutoTokenizer.from_pretrained(self.sarcasm_model_name)
-        self.sarcasm_model = AutoModelForSequenceClassification.from_pretrained(self.sarcasm_model_name)
-        
-        # Initialize emotion detection model
-        self.emotion_model_name = "SamLowe/roberta-base-go_emotions"
-        self.emotion_tokenizer = AutoTokenizer.from_pretrained(self.emotion_model_name)
-        self.emotion_model = AutoModelForSequenceClassification.from_pretrained(self.emotion_model_name)
-        
-        # Initialize zero-shot classifier
-        self.zero_shot_pipeline = pipeline("zero-shot-classification", 
-                                         model="facebook/bart-large-mnli")
-        
-        # Initialize traditional NLP sentiment analyzer (VADER)
-        self.sia = SentimentIntensityAnalyzer()
-        
-        # Configure device (use GPU if available)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.sentiment_model.to(self.device)
-        self.sarcasm_model.to(self.device)
-        self.emotion_model.to(self.device)
-        
-        # Sentiment labels mapping
-        self.id2label = {
-            0: "Negative",
-            1: "Neutral",
-            2: "Positive"
-        }
-        
-        # Emotion labels (from the Go Emotions dataset)
-        self.emotion_labels = [
-            'admiration', 'amusement', 'anger', 'annoyance', 'approval', 'caring',
-            'confusion', 'curiosity', 'desire', 'disappointment', 'disapproval',
-            'disgust', 'embarrassment', 'excitement', 'fear', 'gratitude', 'grief',
-            'joy', 'love', 'nervousness', 'optimism', 'pride', 'realization',
-            'relief', 'remorse', 'sadness', 'surprise', 'neutral'
-        ]
-        
-        # Text preprocessing tools
-        self.stop_words = set(stopwords.words('english'))
-        self.lemmatizer = WordNetLemmatizer()
-    
-    def _preprocess_text(self, text: str) -> str:
-        """Enhanced text preprocessing"""
-        # Convert to lowercase
-        text = text.lower()
-        
-        # Remove URLs
-        text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-        
-        # Remove user @ references and '#' from hashtags
-        text = re.sub(r'\@\w+|\#', '', text)
-        
-        # Remove punctuation and special chars
-        text = re.sub(r'[^\w\s]', '', text)
-        
-        # Remove stopwords and lemmatize
-        text = ' '.join([self.lemmatizer.lemmatize(word) for word in text.split() if word not in self.stop_words])
-        
-        return text.strip()
-    
-    def detect_sarcasm(self, text: str) -> Dict:
-        """Detect sarcasm in text"""
+        # Multilingual sentiment model
+        sentiment_model_name = model_dict["sentiment"]
+        models["multilingual_sentiment"] = AutoModelForSequenceClassification.from_pretrained(sentiment_model_name).to(device)
+        tokenizers["multilingual_sentiment"] = AutoTokenizer.from_pretrained(sentiment_model_name)
+    else:
+        for task, model_name in model_dict.items():
+            key = f"{lang}_{task}"
+            models[key] = AutoModelForSequenceClassification.from_pretrained(model_name).to(device)
+            tokenizers[key] = AutoTokenizer.from_pretrained(model_name)
+
+print("Models loaded successfully!")
+
+# Emotion labels
+EMOTION_LABELS = [
+    "admiration", "amusement", "anger", "annoyance", "approval", "caring",
+    "confusion", "curiosity", "desire", "disappointment", "disapproval",
+    "disgust", "embarrassment", "excitement", "fear", "gratitude", "grief",
+    "joy", "love", "nervousness", "neutral", "optimism", "pride", "realization",
+    "relief", "remorse", "sadness", "surprise"
+]
+
+# Translation functions
+def translate_to_english(text: str, src_lang: str = None) -> str:
+    """Translate text to English for analysis"""
+    if src_lang and src_lang != "en":
         try:
-            inputs = self.sarcasm_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
+            text = f">{src_lang} {text}"
+            inputs = tokenizers["translation"](text, return_tensors="pt", truncation=True).to(device)
+            translated = models["translation"].generate(**inputs)
+            return tokenizers["translation"].decode(translated[0], skip_special_tokens=True)
+        except:
+            return text  # Fallback to original text if translation fails
+    return text
+
+# Sentiment analysis functions
+def analyze_sentiment(text: str, lang: str = "en") -> Dict:
+    """Analyze sentiment with detailed scores"""
+    try:
+        if lang != "en":
+            # Use multilingual model
+            inputs = tokenizers["multilingual_sentiment"](
+                text, 
+                return_tensors="pt", 
+                truncation=True, 
+                padding=True
+            ).to(device)
             with torch.no_grad():
-                outputs = self.sarcasm_model(**inputs)
+                outputs = models["multilingual_sentiment"](**inputs)
             
-            scores = outputs.logits[0].detach().cpu()
-            scores = softmax(scores, dim=0).numpy()
+            scores = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
+            star_rating = np.argmax(scores) + 1  # 1-5 star rating
+            
+            # Convert star rating to sentiment
+            if star_rating <= 2:
+                sentiment = "negative"
+            elif star_rating == 3:
+                sentiment = "neutral"
+            else:
+                sentiment = "positive"
+                
+            return {
+                "sentiment": sentiment,
+                "scores": {
+                    "negative": float(scores[0] + scores[1]) / 2,
+                    "neutral": float(scores[2]),
+                    "positive": float(scores[3] + scores[4]) / 2
+                }
+            }
+        else:
+            # Use English-specific model
+            inputs = tokenizers["en_sentiment"](
+                text, 
+                return_tensors="pt", 
+                truncation=True, 
+                padding=True
+            ).to(device)
+            with torch.no_grad():
+                outputs = models["en_sentiment"](**inputs)
+            
+            scores = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
+            sentiment_labels = ["negative", "neutral", "positive"]
+            sentiment = sentiment_labels[np.argmax(scores)]
             
             return {
-                "Not Sarcastic": float(scores[0]),
-                "Sarcastic": float(scores[1])
+                "sentiment": sentiment,
+                "scores": {
+                    "negative": float(scores[0]),
+                    "neutral": float(scores[1]),
+                    "positive": float(scores[2])
+                }
             }
-        except Exception as e:
-            print(f"Sarcasm detection failed: {e}")
-            return {"Error": str(e)}
-    
-    def analyze_emotions(self, text: str, top_k: int = 3) -> Dict:
-        """Analyze emotions in text"""
-        try:
-            inputs = self.emotion_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.emotion_model(**inputs)
-            
-            scores = outputs.logits[0].detach().cpu()
-            scores = softmax(scores, dim=0).numpy()
-            
-            # Get top emotions
-            top_indices = np.argsort(scores)[-top_k:][::-1]
-            top_emotions = {
-                self.emotion_labels[i]: float(scores[i])
-                for i in top_indices
+    except Exception as e:
+        print(f"Sentiment analysis error: {e}")
+        return {
+            "sentiment": "neutral",
+            "scores": {
+                "negative": 0.0,
+                "neutral": 1.0,
+                "positive": 0.0
             }
-            
-            return top_emotions
-        except Exception as e:
-            print(f"Emotion analysis failed: {e}")
-            return {"Error": str(e)}
-    
-    def analyze_with_transformers(self, text: str) -> Dict:
-        """Analyze sentiment using fine-tuned transformer model"""
-        try:
-            inputs = self.sentiment_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.sentiment_model(**inputs)
-            
-            scores = outputs.logits[0].detach().cpu()
-            scores = softmax(scores, dim=0).numpy()
-            
-            sentiment_scores = {
-                self.id2label[i]: float(score) 
-                for i, score in enumerate(scores)
-            }
-            
-            return sentiment_scores
-        except Exception as e:
-            print(f"Transformer analysis failed: {e}")
-            return {"Error": str(e)}
-    
-    def analyze_with_zeroshot(self, text: str) -> Dict:
-        """Analyze sentiment using zero-shot classification"""
-        try:
-            candidate_labels = ["positive", "negative", "neutral", "sarcastic", "ironic"]
-            result = self.zero_shot_pipeline(text, candidate_labels)
-            return {label: score for label, score in zip(result['labels'], result['scores'])}
-        except Exception as e:
-            print(f"Zero-shot analysis failed: {e}")
-            return {"Error": str(e)}
-    
-    def analyze_with_vader(self, text: str) -> Dict:
-        """Analyze sentiment using VADER sentiment analyzer"""
-        try:
-            scores = self.sia.polarity_scores(text)
-            return {
-                "Negative": scores['neg'],
-                "Neutral": scores['neu'],
-                "Positive": scores['pos'],
-                "Compound": scores['compound']
-            }
-        except Exception as e:
-            print(f"VADER analysis failed: {e}")
-            return {"Error": str(e)}
-    
-    def _adjust_for_sarcasm(self, sentiment_scores: Dict, sarcasm_prob: float) -> Dict:
-        """Adjust sentiment scores based on sarcasm probability"""
-        if sarcasm_prob > 0.7:  # High probability of sarcasm
-            # Invert the sentiment scores
-            adjusted_scores = {
-                "Positive": sentiment_scores["Negative"] * sarcasm_prob,
-                "Neutral": sentiment_scores["Neutral"] * (1 - sarcasm_prob/2),
-                "Negative": sentiment_scores["Positive"] * sarcasm_prob
-            }
-            # Normalize
-            total = sum(adjusted_scores.values())
-            return {k: v/total for k, v in adjusted_scores.items()}
-        return sentiment_scores
-    
-    def _adjust_for_emotions(self, sentiment_scores: Dict, emotions: Dict) -> Dict:
-        """Adjust sentiment based on detected emotions"""
-        negative_emotions = {'anger', 'annoyance', 'disappointment', 'disapproval', 
-                           'disgust', 'embarrassment', 'fear', 'grief', 'remorse', 
-                           'sadness', 'confusion'}
-        
-        positive_emotions = {'admiration', 'amusement', 'approval', 'caring', 
-                           'excitement', 'gratitude', 'joy', 'love', 'optimism', 
-                           'pride', 'relief', 'surprise'}
-        
-        # Calculate emotion influence
-        neg_influence = sum(score for emo, score in emotions.items() if emo in negative_emotions)
-        pos_influence = sum(score for emo, score in emotions.items() if emo in positive_emotions)
-        
-        # Adjust sentiment scores
-        if neg_influence > pos_influence:
-            adjustment_factor = neg_influence - pos_influence
-            sentiment_scores["Negative"] = min(1.0, sentiment_scores["Negative"] + adjustment_factor)
-            sentiment_scores["Positive"] = max(0.0, sentiment_scores["Positive"] - adjustment_factor/2)
-        elif pos_influence > neg_influence:
-            adjustment_factor = pos_influence - neg_influence
-            sentiment_scores["Positive"] = min(1.0, sentiment_scores["Positive"] + adjustment_factor)
-            sentiment_scores["Negative"] = max(0.0, sentiment_scores["Negative"] - adjustment_factor/2)
-        
-        # Normalize
-        total = sum(sentiment_scores.values())
-        return {k: v/total for k, v in sentiment_scores.items()}
-    
-    def ensemble_analysis(self, text: str) -> Dict:
-        """Combine results from multiple methods for robust analysis"""
-        text = self._preprocess_text(text)
-        
-        if not text.strip():
-            return {"error": "Text is empty after preprocessing"}
-        
-        # Get results from all methods
-        transformer_results = self.analyze_with_transformers(text)
-        zeroshot_results = self.analyze_with_zeroshot(text)
-        vader_results = self.analyze_with_vader(text)
-        sarcasm_results = self.detect_sarcasm(text)
-        emotion_results = self.analyze_emotions(text)
-        
-        # Normalize zero-shot results to match other formats
-        normalized_zeroshot = {
-            "Negative": zeroshot_results.get("negative", 0) + zeroshot_results.get("ironic", 0)/2,
-            "Neutral": zeroshot_results.get("neutral", 0),
-            "Positive": zeroshot_results.get("positive", 0),
-            "Sarcastic": zeroshot_results.get("sarcastic", 0)
         }
+
+def detect_sarcasm(text: str) -> Dict:
+    """Detect sarcasm with confidence score"""
+    try:
+        inputs = tokenizers["en_sarcasm"](
+            text, 
+            return_tensors="pt", 
+            truncation=True, 
+            padding=True
+        ).to(device)
+        with torch.no_grad():
+            outputs = models["en_sarcasm"](**inputs)
         
-        # Adjust transformer results for sarcasm
-        sarcasm_prob = max(sarcasm_results.get("Sarcastic", 0), normalized_zeroshot.get("Sarcastic", 0))
-        adjusted_transformer = self._adjust_for_sarcasm(transformer_results, sarcasm_prob)
-        
-        # Further adjust for emotions
-        final_sentiment = self._adjust_for_emotions(adjusted_transformer, emotion_results)
-        
-        # Calculate weighted average
-        ensemble_scores = {
-            "Negative": (0.4 * final_sentiment["Negative"] + 
-                        0.3 * normalized_zeroshot["Negative"] + 
-                        0.3 * vader_results["Negative"]),
-            "Neutral": (0.4 * final_sentiment["Neutral"] + 
-                       0.3 * normalized_zeroshot["Neutral"] + 
-                       0.3 * vader_results["Neutral"]),
-            "Positive": (0.4 * final_sentiment["Positive"] + 
-                       0.3 * normalized_zeroshot["Positive"] + 
-                       0.3 * vader_results["Positive"])
-        }
-        
-        # Normalize to ensure sum to 1
-        total = sum(ensemble_scores.values())
-        ensemble_scores = {k: v/total for k, v in ensemble_scores.items()}
-        
-        # Determine final sentiment
-        final_sentiment_label = max(ensemble_scores.items(), key=lambda x: x[1])[0]
-        
-        # If sarcasm is detected with high confidence, append to label
-        if sarcasm_prob > 0.65:
-            final_sentiment_label = f"{final_sentiment_label} (Sarcastic)"
+        scores = torch.softmax(outputs.logits, dim=1).cpu().numpy()[0]
+        sarcasm_prob = float(scores[1])  # Assuming index 1 is sarcasm
         
         return {
-            "Transformer": transformer_results,
-            "ZeroShot": normalized_zeroshot,
-            "VADER": vader_results,
-            "Sarcasm": sarcasm_results,
-            "Emotions": emotion_results,
-            "Ensemble": ensemble_scores,
-            "Final_Sentiment": final_sentiment_label
+            "is_sarcastic": sarcasm_prob > 0.5,
+            "confidence": sarcasm_prob
+        }
+    except Exception as e:
+        print(f"Sarcasm detection error: {e}")
+        return {
+            "is_sarcastic": False,
+            "confidence": 0.0
         }
 
-def visualize_results(results: Dict) -> Tuple[str, Dict]:
-    """Create visual representation of the analysis results"""
-    final_sentiment = results["Final_Sentiment"]
-    ensemble_scores = results["Ensemble"]
-    
-    # Create sentiment emoji
-    sentiment_emoji = {
-        "Positive": "😊",
-        "Negative": "😞",
-        "Neutral": "😐",
-        "Positive (Sarcastic)": "😏",
-        "Negative (Sarcastic)": "🙄",
-        "Neutral (Sarcastic)": "😒"
-    }.get(final_sentiment, "🤔")
-    
-    # Format emotion results
-    top_emotions = "\n".join(
-        f"- {emo.capitalize()}: {score:.2%}" 
-        for emo, score in results["Emotions"].items()
-    )
-    
-    # Create markdown output
-    markdown_output = f"""
-    ## Enhanced Sentiment Analysis Results
-    
-    **Final Sentiment**: {final_sentiment} {sentiment_emoji}
-    
-    ### Confidence Scores:
-    - Positive: {ensemble_scores['Positive']:.2%}
-    - Neutral: {ensemble_scores['Neutral']:.2%}
-    - Negative: {ensemble_scores['Negative']:.2%}
-    
-    ### Emotional Tone:
-    {top_emotions}
-    
-    ### Sarcasm Detection:
-    - Sarcastic: {results['Sarcasm'].get('Sarcastic', 0):.2%}
-    - Not Sarcastic: {results['Sarcasm'].get('Not Sarcastic', 0):.2%}
-    
-    ### Detailed Breakdown:
-    **Transformer Model (RoBERTa):**
-    - Positive: {results['Transformer']['Positive']:.2%}
-    - Neutral: {results['Transformer']['Neutral']:.2%}
-    - Negative: {results['Transformer']['Negative']:.2%}
-    
-    **Zero-Shot Classification:**
-    - Positive: {results['ZeroShot']['Positive']:.2%}
-    - Neutral: {results['ZeroShot']['Neutral']:.2%}
-    - Negative: {results['ZeroShot']['Negative']:.2%}
-    
-    **VADER Sentiment Analyzer:**
-    - Positive: {results['VADER']['Positive']:.2%}
-    - Neutral: {results['VADER']['Neutral']:.2%}
-    - Negative: {results['VADER']['Negative']:.2%}
-    """
-    
-    return markdown_output, ensemble_scores
+def analyze_emotion(text: str) -> Dict:
+    """Analyze emotional content"""
+    try:
+        inputs = tokenizers["en_emotion"](
+            text, 
+            return_tensors="pt", 
+            truncation=True, 
+            padding=True
+        ).to(device)
+        with torch.no_grad():
+            outputs = models["en_emotion"](**inputs)
+        
+        scores = torch.sigmoid(outputs.logits).cpu().numpy()[0]
+        top_emotions = sorted(zip(EMOTION_LABELS, scores), key=lambda x: x[1], reverse=True)[:3]
+        
+        return {
+            "emotions": {emotion: float(score) for emotion, score in top_emotions},
+            "dominant_emotion": top_emotions[0][0]
+        }
+    except Exception as e:
+        print(f"Emotion analysis error: {e}")
+        return {
+            "emotions": {"neutral": 1.0},
+            "dominant_emotion": "neutral"
+        }
 
-# Initialize analyzer
-analyzer = EnhancedSentimentAnalyzer()
+def detect_language(text: str) -> str:
+    """Language detection using langdetect"""
+    try:
+        lang = detect(text)
+        return lang if lang in ['en', 'es', 'fr', 'de'] else 'en'
+    except:
+        return 'en'
 
-def analyze_sentiment(text: str) -> Dict:
-    """Main function to analyze sentiment of input text"""
-    if not text.strip():
-        return {"error": "Please enter some text to analyze."}
+def comprehensive_analysis(text: str) -> Tuple[Dict, str]:
+    """Perform comprehensive sentiment, emotion, and sarcasm analysis"""
+    try:
+        # Detect language
+        lang = detect_language(text)
+        translated_text = text if lang == "en" else translate_to_english(text, lang)
+        
+        # Get sentiment
+        sentiment_result = analyze_sentiment(text, lang)
+        
+        # Get sarcasm (English only)
+        sarcasm_result = detect_sarcasm(translated_text) if lang == "en" else {"is_sarcastic": False, "confidence": 0.0}
+        
+        # Get emotions (English only)
+        emotion_result = analyze_emotion(translated_text) if lang == "en" else {"emotions": {}, "dominant_emotion": "neutral"}
+        
+        # Adjust sentiment if sarcasm is detected
+        final_sentiment = sentiment_result["sentiment"]
+        if sarcasm_result["is_sarcastic"] and sarcasm_result["confidence"] > 0.6:
+            if final_sentiment == "positive":
+                final_sentiment = "negative"
+            elif final_sentiment == "negative":
+                final_sentiment = "positive"
+        
+        # Prepare detailed results
+        detailed_results = {
+            "text": text,
+            "language": lang,
+            "sentiment": final_sentiment,
+            "sentiment_scores": sentiment_result["scores"],
+            "sarcasm_detected": sarcasm_result["is_sarcastic"],
+            "sarcasm_confidence": sarcasm_result["confidence"],
+            "emotions": emotion_result["emotions"],
+            "dominant_emotion": emotion_result["dominant_emotion"],
+            "translated_text": translated_text if lang != "en" else None
+        }
+        
+        # Prepare human-readable response
+        response_parts = []
+        
+        # Apply sentiment color
+        sentiment_display = f"Sentiment: {final_sentiment.upper()}"
+        if final_sentiment == "positive":
+            sentiment_display = f"<span class='sentiment-positive'>{sentiment_display}</span>"
+        elif final_sentiment == "negative":
+            sentiment_display = f"<span class='sentiment-negative'>{sentiment_display}</span>"
+        else:
+            sentiment_display = f"<span class='sentiment-neutral'>{sentiment_display}</span>"
+        
+        response_parts.append(sentiment_display)
+        
+        if lang != "en":
+            response_parts.append(f"Detected Language: {lang.upper()}")
+        
+        if sarcasm_result["is_sarcastic"]:
+            sarcasm_display = f"⚠️ <span class='sarcasm-detected'>Sarcasm detected: {sarcasm_result['confidence']*100:.1f}% confidence</span>"
+            response_parts.append(sarcasm_display)
+        
+        if emotion_result["emotions"]:
+            top_emotion, top_score = next(iter(emotion_result["emotions"].items()))
+            response_parts.append(f"Dominant Emotion: {top_emotion.capitalize()} ({top_score*100:.1f}%)")
+        
+        if sentiment_result["sentiment"] != final_sentiment and sarcasm_result["is_sarcastic"]:
+            response_parts.append(f"Note: Sentiment reversed due to sarcasm detection")
+        
+        response = "<br>".join(response_parts)
+        
+        return detailed_results, response
+    except Exception as e:
+        print(f"Comprehensive analysis error: {e}")
+        return {
+            "text": text,
+            "language": "en",
+            "sentiment": "neutral",
+            "sentiment_scores": {"negative": 0.0, "neutral": 1.0, "positive": 0.0},
+            "sarcasm_detected": False,
+            "sarcasm_confidence": 0.0,
+            "emotions": {"neutral": 1.0},
+            "dominant_emotion": "neutral",
+            "translated_text": text
+        }, "Error in analysis. Please try again."
+
+# Gradio UI with typing animation
+def respond(message: str, history: List[List[str]]):
+    """Chatbot response function with typing animation"""
+    # First yield the message with user avatar
+    history.append([message, None])
+    yield history
     
-    results = analyzer.ensemble_analysis(text)
-    if "error" in results:
-        return results
+    # Simulate typing animation
+    for i in range(3):
+        history[-1][1] = "..." * (i + 1)
+        yield history
+        sleep(0.1)
     
-    markdown_output, scores = visualize_results(results)
+    # Process the message
+    analysis, response = comprehensive_analysis(message)
     
-    return {
-        "markdown": markdown_output,
-        "scores": scores,
-        "sentiment": results["Final_Sentiment"],
-        "emotions": results["Emotions"],
-        "sarcasm": results["Sarcasm"].get("Sarcastic", 0)
-    }
+    # Simulate typing out the response
+    typed_response = ""
+    for char in response:
+        typed_response += char
+        history[-1][1] = typed_response
+        sleep(0.02)
+        yield history
+
+# Custom CSS for advanced UI
+custom_css = """
+.gradio-container {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+.chatbot {
+    min-height: 400px;
+    border-radius: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+.dark .chatbot {
+    background-color: #1f1f1f;
+}
+.textbox textarea {
+    font-size: 16px;
+    padding: 12px;
+    border-radius: 8px;
+}
+.sentiment-positive {
+    color: #10B981;
+    font-weight: bold;
+}
+.sentiment-negative {
+    color: #EF4444;
+    font-weight: bold;
+}
+.sentiment-neutral {
+    color: #6B7280;
+    font-weight: bold;
+}
+.sarcasm-detected {
+    color: #F59E0B;
+    font-weight: bold;
+}
+"""
 
 # Create Gradio interface
-with gr.Blocks(title="Enhanced Sentiment Analysis Tool", theme="soft") as demo:
-    gr.Markdown("# 🌟 Enhanced AI Sentiment Analysis Tool")
-    gr.Markdown("Analyze text sentiment with sarcasm and emotion detection")
+with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🤖 Advanced Sentiment Analysis Chatbot")
+    gr.Markdown("This tool analyzes sentiment, emotion, and sarcasm in multiple languages with high accuracy.")
     
     with gr.Row():
-        with gr.Column():
-            input_text = gr.Textbox(
-                label="Enter your text here",
-                placeholder="Type or paste text to analyze sentiment...",
-                lines=5
+        with gr.Column(scale=2):
+            chatbot = gr.Chatbot(
+                label="Conversation",
+                bubble_full_width=False,
+                avatar_images=(
+                    "https://i.imgur.com/7aXU3dy.png",  # User avatar
+                    "https://i.imgur.com/qh3UygJ.png"   # Bot avatar
+                ),
+                render_markdown=True
             )
-            analyze_btn = gr.Button("Analyze Sentiment", variant="primary")
-            
-        with gr.Column():
-            output_markdown = gr.Markdown(label="Analysis Results")
-            sentiment_output = gr.Label(label="Predicted Sentiment")
-            with gr.Accordion("Detailed Scores", open=False):
-                sentiment_scores = gr.Label(label="Confidence Scores")
-                emotion_chart = gr.Label(label="Top Emotions")
-                sarcasm_gauge = gr.Label(label="Sarcasm Probability")
+            msg = gr.Textbox(
+                placeholder="Type a message in any language...",
+                label="Message",
+                autofocus=True
+            )
+            btn = gr.Button("Analyze")
+            clear = gr.ClearButton([msg, chatbot])
+        
+        with gr.Column(scale=1):
+            gr.Markdown("## Analysis Details")
+            sentiment_output = gr.Label(label="Sentiment")
+            emotion_output = gr.Label(label="Top Emotions")
+            sarcasm_output = gr.Label(label="Sarcasm Detection")
+            language_output = gr.Label(label="Detected Language")
+            raw_output = gr.JSON(label="Raw Analysis Data")
     
-    # Examples with sarcastic and complex emotional texts
-    gr.Examples(
-        examples=[
-            ["I absolutely love this product! It's amazing and works perfectly."],
-            ["The service was terrible and the staff was rude. Never coming back!"],
-            ["This university is so great, I can't wait to fail all my exams here!"],
-            ["Oh wonderful, another meeting that could have been an email."],
-            ["I'm thrilled to be working late again tonight. Really, just overjoyed."],
-            ["The movie was... interesting. If by interesting you mean boring."]
-        ],
-        inputs=input_text,
-        label="Try these examples (including sarcastic ones)"
+    # Event handlers
+    def process_message(message: str):
+        analysis, _ = comprehensive_analysis(message)
+        return (
+            {"label": analysis["sentiment"].upper()},
+            {"label": ", ".join([f"{k} ({v:.2f})" for k, v in analysis["emotions"].items()])},
+            {"label": f"{analysis['sarcasm_confidence']*100:.1f}% confident" if analysis["sarcasm_detected"] else "Not detected"},
+            {"label": analysis["language"].upper()},
+            analysis
+        )
+    
+    msg.submit(
+        fn=respond,
+        inputs=[msg, chatbot],
+        outputs=[chatbot]
+    ).then(
+        fn=process_message,
+        inputs=msg,
+        outputs=[
+            sentiment_output,
+            emotion_output,
+            sarcasm_output,
+            language_output,
+            raw_output
+        ]
     )
     
-    # Analysis function
-    def analyze_and_display(text):
-        result = analyze_sentiment(text)
-        if "error" in result:
-            return {
-                output_markdown: f"## Error\n{result['error']}",
-                sentiment_output: "Error",
-                sentiment_scores: {},
-                emotion_chart: {},
-                sarcasm_gauge: {}
-            }
-        
-        # Format emotions for display
-        emotions_formatted = "\n".join(
-            f"{emo.capitalize()}: {score:.2%}" 
-            for emo, score in result["emotions"].items()
-        )
-        
-        # Format sarcasm probability
-        sarcasm_formatted = f"Sarcastic: {result['sarcasm']:.2%}"
-        
-        return {
-            output_markdown: result["markdown"],
-            sentiment_output: result["sentiment"],
-            sentiment_scores: result["scores"],
-            emotion_chart: emotions_formatted,
-            sarcasm_gauge: sarcasm_formatted
-        }
-    
-    analyze_btn.click(
-        fn=analyze_and_display,
-        inputs=input_text,
-        outputs=[output_markdown, sentiment_output, sentiment_scores, emotion_chart, sarcasm_gauge]
+    btn.click(
+        fn=respond,
+        inputs=[msg, chatbot],
+        outputs=[chatbot]
+    ).then(
+        fn=process_message,
+        inputs=msg,
+        outputs=[
+            sentiment_output,
+            emotion_output,
+            sarcasm_output,
+            language_output,
+            raw_output
+        ]
     )
 
 if __name__ == "__main__":
-    # Run the Gradio app
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch()
