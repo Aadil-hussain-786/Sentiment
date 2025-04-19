@@ -132,4 +132,3 @@ graph TD
     O --> P[Confidence Calibration]
     P --> Q[Result Formatting]
     Q --> R[Output]
-
